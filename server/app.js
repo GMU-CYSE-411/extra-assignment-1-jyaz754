@@ -3,9 +3,22 @@ const path = require("path");
 const express = require("express");
 const cookieParser = require("cookie-parser");
 const { DEFAULT_DB_FILE, openDatabase } = require("../db");
-
+const crypto = require("crypto");
+const rateLimit = require("express-rate-limit"); 
+function sanitizeInput(userInput) {
+  if (userInput === "") {
+    return userInput;
+  }
+  return String(userInput ?? "").replace(/[^A-Za-z0-9_-]/g, "_");
+}
 function sendPublicFile(response, fileName) {
-  response.sendFile(path.join(__dirname, "..", "public", fileName));
+  const pubRoot = path.resolve(__dirname, "..", "public");
+  const filePath = path.resolve(pubRoot, fileName);
+  if (!filePath.startsWith(pubRoot)) {
+    return res.status(400).send("Bad Request");
+  }
+  return res.sendFile(filePath);
+  response.sendFile(path.resolve(__dirname, "..", "public", fileName));
 }
 
 function createSessionId() {
@@ -27,10 +40,12 @@ async function createApp() {
   app.use(cookieParser());
   app.use("/css", express.static(path.join(__dirname, "..", "public", "css")));
   app.use("/js", express.static(path.join(__dirname, "..", "public", "js")));
-
+  
+  app.use("/api/login", rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 5,
+  }));
   app.use(async (request, response, next) => {
-    const sessionId = request.cookies.sid;
-
     if (!sessionId) {
       request.currentUser = null;
       next();
@@ -75,7 +90,12 @@ async function createApp() {
   }
 
   app.get("/", (_request, response) => sendPublicFile(response, "index.html"));
-  app.get("/login", (_request, response) => sendPublicFile(response, "login.html"));
+  app.get("/login", (_request, response) => {
+    sendPublicFile(response, "login.html")
+    const csrfToken = crypto.randomBytes(32).toString("hex");
+    req.session.csrfToken = csrfToken;
+    res.render("login", {csrfToken});
+  });
   app.get("/notes", (_request, response) => sendPublicFile(response, "notes.html"));
   app.get("/settings", (_request, response) => sendPublicFile(response, "settings.html"));
   app.get("/admin", (_request, response) => sendPublicFile(response, "admin.html"));
@@ -85,15 +105,17 @@ async function createApp() {
   });
 
   app.post("/api/login", async (request, response) => {
-    const username = String(request.body.username || "");
-    const password = String(request.body.password || "");
-
+    const username = String(sanitizeInput(request.body.username) || "");
+    const password = String(sanitizeInput(request.body.password) || "");
+    if (req.body.csrfToken !== req.session.csrfToken){
+      return.status(403).send("csrf validation failed");
+    }
     const query = `
       SELECT id, username, role, display_name
       FROM users
-      WHERE username = '${username}' AND password = '${password}'
+      WHERE username = ? AND password = ?
     `;
-    const user = await db.get(query);
+    const user = await db.get(query, [username, password]);
 
     if (!user) {
       response.status(401).json({ error: "Invalid username or password." });
@@ -109,7 +131,10 @@ async function createApp() {
     );
 
     response.cookie("sid", sessionId, {
-      path: "/"
+      path: "/",
+      httpOnly: true,
+      secure: true,        
+      sameSite: "Strict"
     });
 
     response.json({
@@ -127,16 +152,19 @@ async function createApp() {
     if (request.cookies.sid) {
       await db.run("DELETE FROM sessions WHERE id = ?", [request.cookies.sid]);
     }
-
+    
     response.clearCookie("sid");
     response.json({ ok: true });
   });
 
   app.get("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = request.query.ownerId || request.currentUser.id;
-    const search = request.query.search || "";
+    const ownerId = sanitizeInput(request.query.ownerId) || sanitizeInput(request.currentUser.id);
+    const search = sanitizeInput(request.query.search) || "";
 
-    const notes = await db.all(`
+   const searchQuery = `%${search}%`; // this is because was having trouble with the search querry var
+
+    const notes = await db.all(
+      `
       SELECT
         notes.id,
         notes.owner_id AS ownerId,
@@ -147,19 +175,18 @@ async function createApp() {
         notes.created_at AS createdAt
       FROM notes
       JOIN users ON users.id = notes.owner_id
-      WHERE notes.owner_id = ${ownerId}
-        AND (notes.title LIKE '%${search}%' OR notes.body LIKE '%${search}%')
+      WHERE notes.owner_id = ?
+        AND (notes.title LIKE ? OR notes.body LIKE ?)
       ORDER BY notes.pinned DESC, notes.id DESC
-    `);
-
-    response.json({ notes });
-  });
+      `,
+      [ownerId, searchQuery, searchQuery]
+    );
 
   app.post("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = Number(request.body.ownerId || request.currentUser.id);
-    const title = String(request.body.title || "");
-    const body = String(request.body.body || "");
-    const pinned = request.body.pinned ? 1 : 0;
+    const ownerId = Number(sanitizeInput(request.body.ownerId || request.currentUser.id));
+    const title = String(sanitizeInput(request.body.title || ""));
+    const body = String(sanitizeInput(request.body.body || ""));
+    const pinned = sanitizeInput(request.body.pinned) ? 1 : 0;
 
     const result = await db.run(
       "INSERT INTO notes (owner_id, title, body, pinned, created_at) VALUES (?, ?, ?, ?, ?)",
