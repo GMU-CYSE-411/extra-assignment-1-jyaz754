@@ -5,6 +5,9 @@ const cookieParser = require("cookie-parser");
 const { DEFAULT_DB_FILE, openDatabase } = require("../db");
 const crypto = require("crypto");
 const rateLimit = require("express-rate-limit"); 
+const bcrypt = require("bcyrpt");
+
+
 function sanitizeInput(userInput) {
   if (userInput === "") {
     return userInput;
@@ -93,8 +96,8 @@ async function createApp() {
   app.get("/login", (_request, response) => {
     sendPublicFile(response, "login.html")
     const csrfToken = crypto.randomBytes(32).toString("hex");
-    req.session.csrfToken = csrfToken;
-    res.render("login", {csrfToken});
+    _request.session.csrfToken = csrfToken;
+    response.render("login", {csrfToken});
   });
   app.get("/notes", (_request, response) => sendPublicFile(response, "notes.html"));
   app.get("/settings", (_request, response) => sendPublicFile(response, "settings.html"));
@@ -108,7 +111,7 @@ async function createApp() {
     const username = String(sanitizeInput(request.body.username) || "");
     const password = String(sanitizeInput(request.body.password) || "");
     if (req.body.csrfToken !== req.session.csrfToken){
-      return.status(403).send("csrf validation failed");
+      return response.status(403).send("csrf validation failed");
     }
     const query = `
       SELECT id, username, role, display_name
@@ -122,7 +125,7 @@ async function createApp() {
       return;
     }
 
-    const sessionId = request.cookies.sid || createSessionId();
+    const sessionId = createSessionId();
 
     await db.run("DELETE FROM sessions WHERE id = ?", [sessionId]);
     await db.run(
@@ -254,6 +257,9 @@ async function createApp() {
   });
 
   app.get("/api/admin/users", requireAuth, async (_request, response) => {
+    if (requrest.currentUser.role !== "admin") {
+      return response.status(403).send("Not valid");
+      }
     const users = await db.all(`
       SELECT
         users.id,
